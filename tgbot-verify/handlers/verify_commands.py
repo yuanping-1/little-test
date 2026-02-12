@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import httpx
+import re
 import time
 from typing import Optional
 
@@ -24,6 +25,96 @@ except ImportError:
         return asyncio.Semaphore(3)
 
 logger = logging.getLogger(__name__)
+
+
+NETWORK_ERROR_HINTS = (
+    "timed out",
+    "timeout",
+    "connect",
+    "connection",
+    "network",
+    "read error",
+    "write error",
+    "temporarily unavailable",
+)
+
+SERVER_ERROR_HINTS = (
+    "状态码 5",
+    "status code 5",
+    "internal server error",
+)
+
+CLIENT_ERROR_HINTS = (
+    "状态码 4",
+    "status code 4",
+    "bad request",
+    "步骤 2 错误",
+)
+
+_STATUS_CODE_PATTERN = re.compile(r"(?:状态码|status\s*code)\s*[:：]?\s*(\d{3})", re.IGNORECASE)
+
+
+def _classify_verify_failure(error_message: str) -> str:
+    """分类验证失败原因，便于日志与重试策略判断。"""
+    normalized = (error_message or "").lower()
+
+    if any(hint in normalized for hint in NETWORK_ERROR_HINTS):
+        return "network"
+
+    status_match = _STATUS_CODE_PATTERN.search(normalized)
+    if status_match:
+        status_code = int(status_match.group(1))
+        if status_code >= 500:
+            return "server"
+        if 400 <= status_code < 500:
+            return "client"
+
+    if any(hint in normalized for hint in SERVER_ERROR_HINTS):
+        return "server"
+    if any(hint in normalized for hint in CLIENT_ERROR_HINTS):
+        return "client"
+    return "business"
+
+
+async def _run_verify_with_retry(verifier, max_retries: int = 2, retry_delay: float = 1.0):
+    """执行验证流程并在网络波动时进行有限重试。"""
+    last_result = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            result = await asyncio.to_thread(verifier.verify)
+            last_result = result
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            logger.warning(
+                "verify 网络异常，attempt=%s/%s, error=%s",
+                attempt + 1,
+                max_retries + 1,
+                exc,
+            )
+            if attempt >= max_retries:
+                raise
+            await asyncio.sleep(retry_delay * (attempt + 1))
+            continue
+
+        if result.get("success"):
+            return result
+
+        failure_type = _classify_verify_failure(result.get("message", ""))
+        should_retry = failure_type in {"network", "server"}
+        if should_retry and attempt < max_retries:
+            logger.warning(
+                "verify 返回可重试失败，准备重试 attempt=%s/%s, failure_type=%s, message=%s",
+                attempt + 1,
+                max_retries + 1,
+                failure_type,
+                result.get("message", ""),
+            )
+            await asyncio.sleep(retry_delay * (attempt + 1))
+            continue
+
+        return result
+
+    return last_result or {"success": False, "message": "未知错误"}
 
 
 async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE, db: Database):
@@ -61,24 +152,40 @@ async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE, db:
         await update.message.reply_text("扣除积分失败，请稍后重试。")
         return
 
-    processing_msg = await update.message.reply_text(
-        f"开始处理 Gemini One Pro 认证...\n"
-        f"验证ID: {verification_id}\n"
-        f"已扣除 {VERIFY_COST} 积分\n\n"
-        "请稍候，这可能需要 1-2 分钟..."
-    )
+    balance_deducted = True
+    processing_msg = None
+    verification_status = "failed"
+    verification_result = ""
 
     try:
-        verifier = OneVerifier(verification_id)
-        result = await asyncio.to_thread(verifier.verify)
-
-        db.add_verification(
-            user_id,
-            "gemini_one_pro",
-            url,
-            "success" if result["success"] else "failed",
-            str(result),
+        processing_msg = await update.message.reply_text(
+            f"开始处理 Gemini One Pro 认证...\n"
+            f"验证ID: {verification_id}\n"
+            f"已扣除 {VERIFY_COST} 积分\n\n"
+            "请稍候，这可能需要 1-2 分钟..."
         )
+
+        verifier = OneVerifier(verification_id)
+        result = await _run_verify_with_retry(verifier)
+
+        verification_status = "success" if result.get("success") else "failed"
+        verification_result = str(result)
+
+        failure_type = _classify_verify_failure(result.get("message", ""))
+        if result.get("success"):
+            logger.info(
+                "Gemini One Pro 验证成功 user_id=%s verification_id=%s",
+                user_id,
+                verification_id,
+            )
+        else:
+            logger.warning(
+                "Gemini One Pro 验证失败 user_id=%s verification_id=%s failure_type=%s message=%s",
+                user_id,
+                verification_id,
+                failure_type,
+                result.get("message", ""),
+            )
 
         if result["success"]:
             result_msg = "✅ 认证成功！\n\n"
@@ -88,18 +195,65 @@ async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE, db:
                 result_msg += f"跳转链接：\n{result['redirect_url']}"
             await processing_msg.edit_text(result_msg)
         else:
-            db.add_balance(user_id, VERIFY_COST)
+            if balance_deducted:
+                db.add_balance(user_id, VERIFY_COST)
+                balance_deducted = False
             await processing_msg.edit_text(
                 f"❌ 认证失败：{result.get('message', '未知错误')}\n\n"
                 f"已退回 {VERIFY_COST} 积分"
             )
-    except Exception as e:
-        logger.error("验证过程出错: %s", e)
-        db.add_balance(user_id, VERIFY_COST)
-        await processing_msg.edit_text(
-            f"❌ 处理过程中出现错误：{str(e)}\n\n"
-            f"已退回 {VERIFY_COST} 积分"
+    except (httpx.TimeoutException, httpx.NetworkError) as e:
+        logger.exception(
+            "Gemini One Pro 网络异常 user_id=%s verification_id=%s",
+            user_id,
+            verification_id,
         )
+        verification_result = f"NetworkError: {e}"
+        if balance_deducted:
+            db.add_balance(user_id, VERIFY_COST)
+            balance_deducted = False
+        if processing_msg:
+            await processing_msg.edit_text(
+                f"❌ 网络异常导致处理失败：{str(e)}\n\n"
+                f"已退回 {VERIFY_COST} 积分"
+            )
+    except Exception as e:
+        error_text = str(e)
+        failure_type = _classify_verify_failure(error_text)
+        log_method = logger.exception if failure_type in {"server", "business"} else logger.warning
+        log_method(
+            "Gemini One Pro 处理异常 user_id=%s verification_id=%s failure_type=%s error=%s",
+            user_id,
+            verification_id,
+            failure_type,
+            error_text,
+        )
+        verification_result = f"{failure_type} error: {error_text}"
+        if balance_deducted:
+            db.add_balance(user_id, VERIFY_COST)
+            balance_deducted = False
+        if processing_msg:
+            await processing_msg.edit_text(
+                f"❌ 处理过程中出现错误：{error_text}\n\n"
+                f"已退回 {VERIFY_COST} 积分"
+            )
+    finally:
+        if not verification_result:
+            verification_result = "Unknown failure"
+        saved = db.add_verification(
+            user_id,
+            "gemini_one_pro",
+            url,
+            verification_status,
+            verification_result,
+        )
+        if not saved:
+            logger.error(
+                "Gemini One Pro 记录验证结果失败 user_id=%s verification_id=%s status=%s",
+                user_id,
+                verification_id,
+                verification_status,
+            )
 
 
 async def verify2_command(update: Update, context: ContextTypes.DEFAULT_TYPE, db: Database):
