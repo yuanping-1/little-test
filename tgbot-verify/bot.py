@@ -39,6 +39,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 避免在 INFO 级别输出完整请求 URL（含 bot token）
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram.request").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.Application").setLevel(logging.INFO)
+
 
 async def error_handler(update: object, context) -> None:
     """全局错误处理"""
