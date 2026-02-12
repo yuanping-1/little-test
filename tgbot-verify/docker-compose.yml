@@ -1,0 +1,39 @@
+version: '3'
+
+services:
+  tgbot:
+    build: .
+    container_name: sheerid-tgbot
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+      - TZ=Asia/Shanghai
+      - PYTHONUNBUFFERED=1
+      # 机器人基本配置 (从 .env 文件读取)
+      - BOT_TOKEN=${BOT_TOKEN}
+      - CHANNEL_USERNAME=${CHANNEL_USERNAME}
+      - CHANNEL_URL=${CHANNEL_URL}
+      - ADMIN_USER_ID=${ADMIN_USER_ID}
+      # 数据库配置 (强制连接到下面的 db 容器)
+      - MYSQL_HOST=db
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=root
+      - MYSQL_DATABASE=tgbot_verify
+    volumes:
+      - ./logs:/app/logs
+
+  db:
+    image: mysql:5.7
+    container_name: tgbot-mysql
+    restart: always
+    environment:
+      - MYSQL_ROOT_PASSWORD=root
+      - MYSQL_DATABASE=tgbot_verify
+      - TZ=Asia/Shanghai
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+volumes:
+  mysql_data:
